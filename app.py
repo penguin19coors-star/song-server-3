@@ -153,7 +153,7 @@ def download_audio():
             }), 500
 
         filename = os.path.basename(filepath)
-        base_url = request.host_url.rstrip("/").replace("http://", "https://")
+        base_url = f"https://{request.host}"
         file_url = f"{base_url}/files/{filename}"
         file_size = os.path.getsize(filepath)
         file_size_mb = round(file_size / (1024 * 1024), 2)
