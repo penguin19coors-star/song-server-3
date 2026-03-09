@@ -57,6 +57,7 @@ def download_and_convert(query, safe_name, file_id, output_template, quality="hi
             "--no-warnings",
             "--no-check-certificates",
             "--extractor-args", "youtube:player_client=mediaconnect",
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "-o", output_template,
             f"ytsearch1:{query}",
         ],
