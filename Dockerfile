@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# Install system deps: ffmpeg + Node.js (for the bgutil POT server) + curl + git
+# Install system deps: ffmpeg + Node.js + curl + git
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         curl \
@@ -17,12 +17,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Force latest yt-dlp (busts pip layer cache via the ARG below)
-ARG YTDLP_CACHE_BUST=1
-RUN pip install --no-cache-dir --upgrade --force-reinstall --pre yt-dlp
+# Force latest yt-dlp + yt-dlp-ejs (busts pip layer cache via the ARG below).
+# yt-dlp-ejs ships the JavaScript challenge solver scripts that yt-dlp needs
+# to decrypt YouTube stream URLs ("signature" and "n" challenges).
+ARG YTDLP_CACHE_BUST=2
+RUN pip install --no-cache-dir --upgrade --force-reinstall --pre yt-dlp yt-dlp-ejs
 
 # --- bgutil POT provider HTTP server (Node.js) ---
-# Pin to a known-good version; bump as needed.
 ENV BGUTIL_VERSION=1.3.1
 RUN git clone --single-branch --branch ${BGUTIL_VERSION} \
         https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil \
