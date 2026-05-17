@@ -1,17 +1,40 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+# Install system deps: ffmpeg + Node.js (for the bgutil POT server) + curl + git
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        curl \
+        git \
+        ca-certificates \
+        gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# --- Python deps ---
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Force yt-dlp to the latest version on every build (busts Docker layer cache).
-# Bump this number whenever you want to force a fresh yt-dlp install.
+# Force latest yt-dlp (busts pip layer cache via the ARG below)
 ARG YTDLP_CACHE_BUST=1
 RUN pip install --no-cache-dir --upgrade --force-reinstall --pre yt-dlp
 
-COPY . .
+# --- bgutil POT provider HTTP server (Node.js) ---
+# Pin to a known-good version; bump as needed.
+ENV BGUTIL_VERSION=1.3.1
+RUN git clone --single-branch --branch ${BGUTIL_VERSION} \
+        https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil \
+    && cd /opt/bgutil/server \
+    && npm ci \
+    && npx tsc
 
-CMD gunicorn --bind 0.0.0.0:8080 --timeout 180 --workers 2 app:app
+# --- yt-dlp plugin that talks to the bgutil server ---
+RUN pip install --no-cache-dir --upgrade bgutil-ytdlp-pot-provider
+
+# --- App code ---
+COPY . .
+RUN chmod +x /app/start.sh
+
+CMD ["/app/start.sh"]
