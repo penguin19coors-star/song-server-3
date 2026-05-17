@@ -74,13 +74,10 @@ QUALITY_PRESETS = {
     "max": {"bitrate": "320k", "sample_rate": "44100", "channels": "2"},
 }
 
-# Player clients to try, in order. Different clients expose different formats.
-PLAYER_CLIENT_FALLBACKS = ["default", "web_safari", "mweb", "tv", "ios", "android"]
+# Order matters: try the clients most likely to succeed first.
+# `tv` and `ios` are usually most resilient to format restrictions.
+PLAYER_CLIENT_FALLBACKS = ["tv", "ios", "android", "mweb", "web_safari", "default"]
 
-# Format selector with fallbacks:
-#   1. Best audio-only stream
-#   2. Best stream that has audio (combined video+audio)
-#   3. Anything (last resort — ffmpeg will extract audio later)
 FORMAT_SELECTOR = "bestaudio/best[acodec!=none]/best"
 
 USER_AGENT = (
@@ -89,27 +86,26 @@ USER_AGENT = (
     "Version/17.0 Safari/605.1.15"
 )
 
+# Per-client timeout. Total time budget ≈ MAX_CLIENTS_TO_TRY * PER_CLIENT_TIMEOUT.
+PER_CLIENT_TIMEOUT = 25
+MAX_CLIENTS_TO_TRY = 3  # Don't burn through all 6 — fail fast
+
 
 def _looks_like_recoverable_error(stderr: str) -> bool:
-    """Check if the error might be fixed by trying a different player_client."""
     if not stderr:
         return False
     s = stderr.lower()
     needles = [
-        # Bot detection
         "sign in to confirm",
         "confirm you're not a bot",
         "confirm you\u2019re not a bot",
         "this video is not available",
-        # HTTP errors
         "http error 403",
         "http error 429",
-        # Format/extraction issues — different clients expose different formats
         "requested format is not available",
         "no video formats found",
         "unable to extract",
         "no such format",
-        # PO token issues
         "po token",
         "precondition check failed",
     ]
@@ -127,11 +123,10 @@ def _run_ytdlp(query, output_template, player_client):
         "--no-check-certificates",
         "--extractor-args", f"youtube:player_client={player_client}",
         "--user-agent", USER_AGENT,
-        "--sleep-requests", "1",
-        "--sleep-interval", "2",
-        "--max-sleep-interval", "5",
-        "--retries", "3",
-        "--fragment-retries", "3",
+        # Minimal retries inside yt-dlp — we handle fallback at the app level
+        "--retries", "1",
+        "--fragment-retries", "1",
+        "--socket-timeout", "15",
         "-o", output_template,
     ]
 
@@ -143,7 +138,9 @@ def _run_ytdlp(query, output_template, player_client):
 
     cmd.append(f"ytsearch1:{query}")
 
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=PER_CLIENT_TIMEOUT
+    )
 
 
 def download_and_convert(query, safe_name, file_id, output_template,
@@ -151,9 +148,13 @@ def download_and_convert(query, safe_name, file_id, output_template,
     last_err = None
     tried_clients = []
 
-    for client in PLAYER_CLIENT_FALLBACKS:
+    for client in PLAYER_CLIENT_FALLBACKS[:MAX_CLIENTS_TO_TRY]:
         tried_clients.append(client)
-        result = _run_ytdlp(query, output_template, client)
+        try:
+            result = _run_ytdlp(query, output_template, client)
+        except subprocess.TimeoutExpired:
+            last_err = f"yt-dlp timed out with client={client}"
+            continue
 
         raw_file = None
         for f in os.listdir(AUDIO_DIR):
@@ -166,11 +167,8 @@ def download_and_convert(query, safe_name, file_id, output_template,
 
         last_err = result.stderr[-500:] if result and result.stderr else "no error output"
 
-        # If the error doesn't look recoverable by trying another client, stop
         if not _looks_like_recoverable_error(result.stderr if result else ""):
             break
-
-        time.sleep(1)
 
     raw_file = None
     for f in os.listdir(AUDIO_DIR):
@@ -190,19 +188,23 @@ def download_and_convert(query, safe_name, file_id, output_template,
     preset = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["high"])
     compressed_file = raw_file.replace(".mp3", "_hq.mp3")
 
-    subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", raw_file,
-            "-t", max_seconds,
-            "-b:a", preset["bitrate"],
-            "-ac", preset["channels"],
-            "-ar", preset["sample_rate"],
-            compressed_file,
-        ],
-        capture_output=True,
-        timeout=60,
-    )
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", raw_file,
+                "-t", max_seconds,
+                "-b:a", preset["bitrate"],
+                "-ac", preset["channels"],
+                "-ar", preset["sample_rate"],
+                compressed_file,
+            ],
+            capture_output=True,
+            timeout=45,
+        )
+    except subprocess.TimeoutExpired:
+        # ffmpeg hung — return the original file
+        return raw_file, None
 
     if os.path.exists(compressed_file):
         os.remove(raw_file)
@@ -223,7 +225,8 @@ def home():
             "/download": "Returns JSON with direct URL to MP3",
             "/stream": "Serves MP3 directly",
             "/files/<filename>": "Serves stored MP3 by filename",
-            "/debug/cookies": "Verify cookies file is loaded and not stale",
+            "/debug/cookies": "Verify cookies file is loaded",
+            "/debug/version": "Check yt-dlp version",
         },
         "quality_options": {
             "low": "64kbps mono (smallest, ~480KB per minute)",
@@ -266,6 +269,21 @@ def debug_cookies():
     return jsonify(info)
 
 
+@app.route("/debug/version", methods=["GET"])
+def debug_version():
+    """Check the installed yt-dlp version."""
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--version"], capture_output=True, text=True, timeout=10
+        )
+        return jsonify({
+            "yt_dlp_version": result.stdout.strip(),
+            "stderr": result.stderr.strip() if result.stderr else None,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
 @app.route("/download", methods=["GET"])
 def download_audio():
     query = request.args.get("q", "")
@@ -292,7 +310,7 @@ def download_audio():
             return jsonify({
                 "error": "Could not find or convert audio",
                 "diagnostic": error,
-                "hint": "If you still see errors after this, try updating yt-dlp to the latest version.",
+                "hint": "Check /debug/version. Anything older than mid-2025 will likely fail.",
             }), 500
 
         filename = os.path.basename(filepath)
