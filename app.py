@@ -12,9 +12,8 @@ os.makedirs(AUDIO_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Cookie loading (three options, in priority order)
-#   1. YT_COOKIES_B64   — base64-encoded Netscape cookies.txt (easiest on
-#                          PaaS hosts without secret-file support)
-#   2. YT_COOKIES_FILE  — path to a cookies.txt file on disk
+#   1. YT_COOKIES_B64   — base64-encoded Netscape cookies.txt
+#   2. YT_COOKIES_FILE  — path to cookies.txt on disk
 #   3. Default path     — /etc/secrets/cookies.txt
 # ---------------------------------------------------------------------------
 
@@ -24,7 +23,6 @@ RUNTIME_COOKIES_PATH = "/tmp/yt_cookies.txt"
 
 
 def _resolve_cookies_file():
-    """Return a usable cookies.txt path, or '' if none available."""
     if COOKIES_B64.strip():
         try:
             data = base64.b64decode(COOKIES_B64)
@@ -76,7 +74,14 @@ QUALITY_PRESETS = {
     "max": {"bitrate": "320k", "sample_rate": "44100", "channels": "2"},
 }
 
-PLAYER_CLIENT_FALLBACKS = ["default", "web_safari", "mweb", "tv", "ios"]
+# Player clients to try, in order. Different clients expose different formats.
+PLAYER_CLIENT_FALLBACKS = ["default", "web_safari", "mweb", "tv", "ios", "android"]
+
+# Format selector with fallbacks:
+#   1. Best audio-only stream
+#   2. Best stream that has audio (combined video+audio)
+#   3. Anything (last resort — ffmpeg will extract audio later)
+FORMAT_SELECTOR = "bestaudio/best[acodec!=none]/best"
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -85,18 +90,26 @@ USER_AGENT = (
 )
 
 
-def _looks_like_bot_block(stderr: str) -> bool:
+def _looks_like_recoverable_error(stderr: str) -> bool:
+    """Check if the error might be fixed by trying a different player_client."""
     if not stderr:
         return False
     s = stderr.lower()
     needles = [
+        # Bot detection
         "sign in to confirm",
         "confirm you're not a bot",
         "confirm you\u2019re not a bot",
         "this video is not available",
+        # HTTP errors
         "http error 403",
         "http error 429",
+        # Format/extraction issues — different clients expose different formats
+        "requested format is not available",
+        "no video formats found",
         "unable to extract",
+        "no such format",
+        # PO token issues
         "po token",
         "precondition check failed",
     ]
@@ -106,7 +119,7 @@ def _looks_like_bot_block(stderr: str) -> bool:
 def _run_ytdlp(query, output_template, player_client):
     cmd = [
         "yt-dlp",
-        "-f", "bestaudio",
+        "-f", FORMAT_SELECTOR,
         "--no-playlist",
         "-x",
         "--audio-format", "mp3",
@@ -153,7 +166,8 @@ def download_and_convert(query, safe_name, file_id, output_template,
 
         last_err = result.stderr[-500:] if result and result.stderr else "no error output"
 
-        if not _looks_like_bot_block(result.stderr if result else ""):
+        # If the error doesn't look recoverable by trying another client, stop
+        if not _looks_like_recoverable_error(result.stderr if result else ""):
             break
 
         time.sleep(1)
@@ -231,7 +245,6 @@ def health():
 
 @app.route("/debug/cookies", methods=["GET"])
 def debug_cookies():
-    """Check whether the cookies file is loaded and looks valid."""
     info = {
         "cookies_path": COOKIES_FILE,
         "exists": bool(COOKIES_FILE and os.path.exists(COOKIES_FILE)),
@@ -279,7 +292,7 @@ def download_audio():
             return jsonify({
                 "error": "Could not find or convert audio",
                 "diagnostic": error,
-                "hint": "Visit /debug/cookies to verify your cookies are loaded. If cookies_loaded is false, set YT_COOKIES_B64 or YT_COOKIES_FILE.",
+                "hint": "If you still see errors after this, try updating yt-dlp to the latest version.",
             }), 500
 
         filename = os.path.basename(filepath)
