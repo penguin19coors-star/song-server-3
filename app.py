@@ -39,8 +39,19 @@ print(f"[cookies] Using cookies file: {COOKIES_FILE or '(none)'}")
 PROXY_URL = os.environ.get("PROXY_URL", "")
 
 # --- POT (Proof of Origin) provider config ---
-# The bgutil HTTP server runs locally on this URL (see start.sh).
 POT_SERVER_URL = os.environ.get("POT_SERVER_URL", "http://127.0.0.1:4416")
+
+# Set to "1" to fall back to legacy innertube behavior — sometimes helps when
+# POT tokens aren't being accepted.
+DISABLE_INNERTUBE = os.environ.get("DISABLE_INNERTUBE", "1")
+
+
+def _bgutil_extractor_arg():
+    """Build the youtubepot-bgutilhttp extractor arg string."""
+    parts = [f"base_url={POT_SERVER_URL}"]
+    if DISABLE_INNERTUBE == "1":
+        parts.append("disable_innertube=1")
+    return "youtubepot-bgutilhttp:" + ";".join(parts)
 
 
 def cleanup_old_files():
@@ -72,10 +83,7 @@ QUALITY_PRESETS = {
     "max": {"bitrate": "320k", "sample_rate": "44100", "channels": "2"},
 }
 
-# With POT tokens available, `default` (web) usually works best.
-# Keep fallbacks for resilience.
 PLAYER_CLIENT_FALLBACKS = ["default", "tv", "ios", "mweb"]
-
 FORMAT_SELECTOR = "bestaudio/best[acodec!=none]/best"
 
 USER_AGENT = (
@@ -110,8 +118,6 @@ def _looks_like_recoverable_error(stderr: str) -> bool:
 
 
 def _run_ytdlp(query, output_template, player_client):
-    # Combine multiple extractor args: youtube + youtubepot-bgutilhttp.
-    # Each provider gets its own arg block separated by spaces in the cli.
     cmd = [
         "yt-dlp",
         "-f", FORMAT_SELECTOR,
@@ -121,7 +127,7 @@ def _run_ytdlp(query, output_template, player_client):
         "--no-warnings",
         "--no-check-certificates",
         "--extractor-args", f"youtube:player_client={player_client}",
-        "--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_SERVER_URL}",
+        "--extractor-args", _bgutil_extractor_arg(),
         "--user-agent", USER_AGENT,
         "--retries", "1",
         "--fragment-retries", "1",
@@ -182,6 +188,7 @@ def download_and_convert(query, safe_name, file_id, output_template,
             "cookies_loaded": bool(COOKIES_FILE and os.path.exists(COOKIES_FILE)),
             "proxy_enabled": bool(PROXY_URL),
             "pot_server": POT_SERVER_URL,
+            "disable_innertube": DISABLE_INNERTUBE == "1",
         }
 
     preset = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["high"])
@@ -218,14 +225,16 @@ def home():
         "status": "High-quality MP3 server is running!",
         "cookies_loaded": bool(COOKIES_FILE and os.path.exists(COOKIES_FILE)),
         "pot_server": POT_SERVER_URL,
+        "disable_innertube": DISABLE_INNERTUBE == "1",
         "proxy_enabled": bool(PROXY_URL),
         "endpoints": {
             "/download": "Returns JSON with direct URL to MP3",
             "/stream": "Serves MP3 directly",
             "/files/<filename>": "Serves stored MP3 by filename",
             "/debug/cookies": "Verify cookies file is loaded",
-            "/debug/version": "Check yt-dlp version",
+            "/debug/version": "Check yt-dlp + POT plugin status",
             "/debug/pot": "Check POT server reachability",
+            "/debug/trace": "Verbose trace of a download attempt (?url=... or default Rick Astley)",
         },
         "usage": "/download?q=song+name&quality=high&sec=600",
     })
@@ -263,14 +272,12 @@ def debug_version():
         ver = subprocess.run(
             ["yt-dlp", "--version"], capture_output=True, text=True, timeout=10
         )
-        # Show the loaded plugins/POT providers
         plugin_check = subprocess.run(
             ["yt-dlp", "-v", "--simulate", "--skip-download",
-             "--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_SERVER_URL}",
+             "--extractor-args", _bgutil_extractor_arg(),
              "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
             capture_output=True, text=True, timeout=20,
         )
-        # Pull out only the POT-related debug lines
         pot_lines = [
             l for l in plugin_check.stderr.splitlines()
             if "[pot]" in l.lower() or "po token" in l.lower()
@@ -295,10 +302,60 @@ def debug_pot():
         return jsonify({
             "pot_server_url": POT_SERVER_URL,
             "http_status": result.stdout.strip(),
-            "reachable": result.stdout.strip() in ("200", "404"),  # any response = up
+            "reachable": result.stdout.strip() in ("200", "404"),
         })
     except Exception as e:
         return jsonify({"error": str(e), "pot_server_url": POT_SERVER_URL})
+
+
+@app.route("/debug/trace", methods=["GET"])
+def debug_trace():
+    """Run yt-dlp with verbose logging on a specific video.
+
+    Defaults to a public Rick Astley video (not age-restricted, not geo-blocked).
+    Pass ?url=... for a different target, ?client=... for a different player_client.
+    """
+    target = request.args.get("url", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    client = request.args.get("client", "default")
+
+    cmd = [
+        "yt-dlp",
+        "-v",
+        "--simulate",
+        "--skip-download",
+        "-f", "bestaudio/best",
+        "--extractor-args", f"youtube:player_client={client}",
+        "--extractor-args", _bgutil_extractor_arg(),
+        "--user-agent", USER_AGENT,
+        "--socket-timeout", "20",
+    ]
+    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        cmd += ["--cookies", COOKIES_FILE]
+    if PROXY_URL:
+        cmd += ["--proxy", PROXY_URL]
+    cmd.append(target)
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        all_lines = result.stderr.splitlines()
+        relevant = [
+            l for l in all_lines
+            if any(k in l.lower() for k in [
+                "[pot]", "po token", "format", "extracted", "error",
+                "warning", "innertube", "player response", "skipping client",
+                "disabling",
+            ])
+        ]
+        return jsonify({
+            "target": target,
+            "client": client,
+            "returncode": result.returncode,
+            "relevant_log": relevant[-100:],
+            "stderr_tail": all_lines[-20:],
+            "stdout_tail": result.stdout.splitlines()[-10:],
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Timed out"})
 
 
 @app.route("/download", methods=["GET"])
@@ -327,7 +384,7 @@ def download_audio():
             return jsonify({
                 "error": "Could not find or convert audio",
                 "diagnostic": error,
-                "hint": "Check /debug/pot and /debug/version to verify the POT server is reachable.",
+                "hint": "Run /debug/trace to see what yt-dlp is actually doing.",
             }), 500
 
         filename = os.path.basename(filepath)
