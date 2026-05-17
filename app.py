@@ -4,24 +4,50 @@ import os
 import uuid
 import threading
 import time
+import base64
 
 app = Flask(__name__)
 AUDIO_DIR = "/tmp/audio"
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
-# Path to your YouTube cookies file (Netscape format).
-# Export with a browser extension like "Get cookies.txt LOCALLY" while logged
-# into a THROWAWAY YouTube account (real accounts can get banned).
-# Set the YT_COOKIES_FILE env var, or drop the file at the default path below.
-COOKIES_FILE = os.environ.get("YT_COOKIES_FILE", "/etc/secrets/cookies.txt")
+# ---------------------------------------------------------------------------
+# Cookie loading (three options, in priority order)
+#   1. YT_COOKIES_B64   — base64-encoded Netscape cookies.txt (easiest on
+#                          PaaS hosts without secret-file support)
+#   2. YT_COOKIES_FILE  — path to a cookies.txt file on disk
+#   3. Default path     — /etc/secrets/cookies.txt
+# ---------------------------------------------------------------------------
 
-# Optional proxy (residential proxies work best — cloud IPs are heavily flagged).
-# Example: http://user:pass@host:port
+COOKIES_FILE_PATH = os.environ.get("YT_COOKIES_FILE", "/etc/secrets/cookies.txt")
+COOKIES_B64 = os.environ.get("YT_COOKIES_B64", "")
+RUNTIME_COOKIES_PATH = "/tmp/yt_cookies.txt"
+
+
+def _resolve_cookies_file():
+    """Return a usable cookies.txt path, or '' if none available."""
+    if COOKIES_B64.strip():
+        try:
+            data = base64.b64decode(COOKIES_B64)
+            with open(RUNTIME_COOKIES_PATH, "wb") as f:
+                f.write(data)
+            os.chmod(RUNTIME_COOKIES_PATH, 0o600)
+            return RUNTIME_COOKIES_PATH
+        except Exception as e:
+            print(f"[cookies] Failed to decode YT_COOKIES_B64: {e}")
+
+    if os.path.exists(COOKIES_FILE_PATH):
+        return COOKIES_FILE_PATH
+
+    return ""
+
+
+COOKIES_FILE = _resolve_cookies_file()
+print(f"[cookies] Using cookies file: {COOKIES_FILE or '(none — bot blocks expected)'}")
+
 PROXY_URL = os.environ.get("PROXY_URL", "")
 
 
 def cleanup_old_files():
-    """Delete audio files older than 60 minutes"""
     while True:
         now = time.time()
         for f in os.listdir(AUDIO_DIR):
@@ -38,13 +64,11 @@ threading.Thread(target=cleanup_old_files, daemon=True).start()
 
 
 def make_safe_name(query):
-    """Turn a search query into a safe filename"""
     safe = "".join(c if c.isalnum() or c in " -" else "" for c in query)
     safe = safe[:50].strip().replace(" ", "_")
     return safe
 
 
-# Quality presets
 QUALITY_PRESETS = {
     "low": {"bitrate": "64k", "sample_rate": "22050", "channels": "1"},
     "medium": {"bitrate": "128k", "sample_rate": "44100", "channels": "2"},
@@ -52,15 +76,7 @@ QUALITY_PRESETS = {
     "max": {"bitrate": "320k", "sample_rate": "44100", "channels": "2"},
 }
 
-# Player clients to try, in order. If YouTube blocks one, the next is tried.
-# Each is a separate yt-dlp invocation so we can detect failure and fall back.
-PLAYER_CLIENT_FALLBACKS = [
-    "default",
-    "web_safari",
-    "mweb",
-    "tv",
-    "ios",
-]
+PLAYER_CLIENT_FALLBACKS = ["default", "web_safari", "mweb", "tv", "ios"]
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -76,6 +92,7 @@ def _looks_like_bot_block(stderr: str) -> bool:
     needles = [
         "sign in to confirm",
         "confirm you're not a bot",
+        "confirm you\u2019re not a bot",
         "this video is not available",
         "http error 403",
         "http error 429",
@@ -87,7 +104,6 @@ def _looks_like_bot_block(stderr: str) -> bool:
 
 
 def _run_ytdlp(query, output_template, player_client):
-    """Run yt-dlp once with a specific player_client. Returns CompletedProcess."""
     cmd = [
         "yt-dlp",
         "-f", "bestaudio",
@@ -98,17 +114,15 @@ def _run_ytdlp(query, output_template, player_client):
         "--no-check-certificates",
         "--extractor-args", f"youtube:player_client={player_client}",
         "--user-agent", USER_AGENT,
-        # Light throttling helps avoid rate-flagging
         "--sleep-requests", "1",
         "--sleep-interval", "2",
         "--max-sleep-interval", "5",
-        # Retries within yt-dlp for transient issues
         "--retries", "3",
         "--fragment-retries", "3",
         "-o", output_template,
     ]
 
-    if os.path.exists(COOKIES_FILE):
+    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
         cmd += ["--cookies", COOKIES_FILE]
 
     if PROXY_URL:
@@ -116,27 +130,18 @@ def _run_ytdlp(query, output_template, player_client):
 
     cmd.append(f"ytsearch1:{query}")
 
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=180)
 
 
 def download_and_convert(query, safe_name, file_id, output_template,
                          quality="high", max_seconds="600"):
-    """Step 1: Download audio (with fallback player clients).
-       Step 2: Convert with ffmpeg at desired quality."""
-
     last_err = None
-    result = None
+    tried_clients = []
 
-    # Try each player_client until one succeeds
     for client in PLAYER_CLIENT_FALLBACKS:
+        tried_clients.append(client)
         result = _run_ytdlp(query, output_template, client)
 
-        # Look for a downloaded file
         raw_file = None
         for f in os.listdir(AUDIO_DIR):
             if f.startswith(safe_name) and f.endswith(".mp3"):
@@ -144,18 +149,15 @@ def download_and_convert(query, safe_name, file_id, output_template,
                 break
 
         if raw_file and os.path.exists(raw_file):
-            break  # success!
+            break
 
         last_err = result.stderr[-500:] if result and result.stderr else "no error output"
 
-        # If it doesn't look like a bot/auth issue, no point trying other clients
         if not _looks_like_bot_block(result.stderr if result else ""):
             break
 
-        # Brief pause before fallback attempt
         time.sleep(1)
 
-    # Recompute raw_file after the loop
     raw_file = None
     for f in os.listdir(AUDIO_DIR):
         if f.startswith(safe_name) and f.endswith(".mp3"):
@@ -163,9 +165,14 @@ def download_and_convert(query, safe_name, file_id, output_template,
             break
 
     if not raw_file or not os.path.exists(raw_file):
-        return None, last_err or "download failed"
+        diagnostic = {
+            "stderr": last_err or "download failed",
+            "tried_clients": tried_clients,
+            "cookies_loaded": bool(COOKIES_FILE and os.path.exists(COOKIES_FILE)),
+            "proxy_enabled": bool(PROXY_URL),
+        }
+        return None, diagnostic
 
-    # Step 2: Re-encode with ffmpeg at desired quality
     preset = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["high"])
     compressed_file = raw_file.replace(".mp3", "_hq.mp3")
 
@@ -195,12 +202,14 @@ def download_and_convert(query, safe_name, file_id, output_template,
 def home():
     return jsonify({
         "status": "High-quality MP3 server is running!",
-        "cookies_loaded": os.path.exists(COOKIES_FILE),
+        "cookies_loaded": bool(COOKIES_FILE and os.path.exists(COOKIES_FILE)),
+        "cookies_source": COOKIES_FILE or "none",
         "proxy_enabled": bool(PROXY_URL),
         "endpoints": {
             "/download": "Returns JSON with direct URL to MP3",
             "/stream": "Serves MP3 directly",
             "/files/<filename>": "Serves stored MP3 by filename",
+            "/debug/cookies": "Verify cookies file is loaded and not stale",
         },
         "quality_options": {
             "low": "64kbps mono (smallest, ~480KB per minute)",
@@ -216,13 +225,36 @@ def home():
 def health():
     return jsonify({
         "status": "ok",
-        "cookies_loaded": os.path.exists(COOKIES_FILE),
+        "cookies_loaded": bool(COOKIES_FILE and os.path.exists(COOKIES_FILE)),
     })
+
+
+@app.route("/debug/cookies", methods=["GET"])
+def debug_cookies():
+    """Check whether the cookies file is loaded and looks valid."""
+    info = {
+        "cookies_path": COOKIES_FILE,
+        "exists": bool(COOKIES_FILE and os.path.exists(COOKIES_FILE)),
+    }
+    if info["exists"]:
+        try:
+            with open(COOKIES_FILE, "r") as f:
+                content = f.read()
+            lines = [l for l in content.splitlines() if l and not l.startswith("#")]
+            info["non_comment_lines"] = len(lines)
+            info["mentions_youtube"] = "youtube.com" in content
+            info["looks_like_netscape"] = (
+                content.startswith("# Netscape HTTP Cookie File")
+                or "Netscape HTTP Cookie File" in content[:200]
+            )
+            info["size_bytes"] = len(content)
+        except Exception as e:
+            info["read_error"] = str(e)
+    return jsonify(info)
 
 
 @app.route("/download", methods=["GET"])
 def download_audio():
-    """Downloads audio from YouTube, converts to high-quality MP3, returns a direct URL"""
     query = request.args.get("q", "")
     if not query:
         return jsonify({"error": "No query provided. Use ?q=song+name"}), 400
@@ -246,8 +278,8 @@ def download_audio():
         if not filepath:
             return jsonify({
                 "error": "Could not find or convert audio",
-                "stderr": error,
-                "hint": "If you see bot-check errors, make sure cookies.txt is present and yt-dlp is up to date.",
+                "diagnostic": error,
+                "hint": "Visit /debug/cookies to verify your cookies are loaded. If cookies_loaded is false, set YT_COOKIES_B64 or YT_COOKIES_FILE.",
             }), 500
 
         filename = os.path.basename(filepath)
@@ -273,7 +305,6 @@ def download_audio():
 
 @app.route("/stream", methods=["GET"])
 def stream_audio():
-    """Downloads audio and serves it directly as a high-quality MP3"""
     query = request.args.get("q", "")
     if not query:
         return jsonify({"error": "No query provided. Use ?q=song+name"}), 400
@@ -297,7 +328,7 @@ def stream_audio():
         if not filepath:
             return jsonify({
                 "error": "Could not find or convert audio",
-                "stderr": error,
+                "diagnostic": error,
             }), 500
 
         return send_file(filepath, mimetype="audio/mpeg")
@@ -308,7 +339,6 @@ def stream_audio():
 
 @app.route("/files/<filename>", methods=["GET"])
 def serve_file(filename):
-    """Serves a stored MP3 file directly by filename"""
     if "/" in filename or ".." in filename:
         return jsonify({"error": "Invalid filename"}), 400
 
