@@ -12,11 +12,7 @@ os.makedirs(AUDIO_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Cookie loading (three options, in priority order)
-#   1. YT_COOKIES_B64   — base64-encoded Netscape cookies.txt
-#   2. YT_COOKIES_FILE  — path to cookies.txt on disk
-#   3. Default path     — /etc/secrets/cookies.txt
 # ---------------------------------------------------------------------------
-
 COOKIES_FILE_PATH = os.environ.get("YT_COOKIES_FILE", "/etc/secrets/cookies.txt")
 COOKIES_B64 = os.environ.get("YT_COOKIES_B64", "")
 RUNTIME_COOKIES_PATH = "/tmp/yt_cookies.txt"
@@ -32,17 +28,19 @@ def _resolve_cookies_file():
             return RUNTIME_COOKIES_PATH
         except Exception as e:
             print(f"[cookies] Failed to decode YT_COOKIES_B64: {e}")
-
     if os.path.exists(COOKIES_FILE_PATH):
         return COOKIES_FILE_PATH
-
     return ""
 
 
 COOKIES_FILE = _resolve_cookies_file()
-print(f"[cookies] Using cookies file: {COOKIES_FILE or '(none — bot blocks expected)'}")
+print(f"[cookies] Using cookies file: {COOKIES_FILE or '(none)'}")
 
 PROXY_URL = os.environ.get("PROXY_URL", "")
+
+# --- POT (Proof of Origin) provider config ---
+# The bgutil HTTP server runs locally on this URL (see start.sh).
+POT_SERVER_URL = os.environ.get("POT_SERVER_URL", "http://127.0.0.1:4416")
 
 
 def cleanup_old_files():
@@ -74,9 +72,9 @@ QUALITY_PRESETS = {
     "max": {"bitrate": "320k", "sample_rate": "44100", "channels": "2"},
 }
 
-# Order matters: try the clients most likely to succeed first.
-# `tv` and `ios` are usually most resilient to format restrictions.
-PLAYER_CLIENT_FALLBACKS = ["tv", "ios", "android", "mweb", "web_safari", "default"]
+# With POT tokens available, `default` (web) usually works best.
+# Keep fallbacks for resilience.
+PLAYER_CLIENT_FALLBACKS = ["default", "tv", "ios", "mweb"]
 
 FORMAT_SELECTOR = "bestaudio/best[acodec!=none]/best"
 
@@ -86,9 +84,8 @@ USER_AGENT = (
     "Version/17.0 Safari/605.1.15"
 )
 
-# Per-client timeout. Total time budget ≈ MAX_CLIENTS_TO_TRY * PER_CLIENT_TIMEOUT.
-PER_CLIENT_TIMEOUT = 25
-MAX_CLIENTS_TO_TRY = 3  # Don't burn through all 6 — fail fast
+PER_CLIENT_TIMEOUT = 30
+MAX_CLIENTS_TO_TRY = 3
 
 
 def _looks_like_recoverable_error(stderr: str) -> bool:
@@ -113,6 +110,8 @@ def _looks_like_recoverable_error(stderr: str) -> bool:
 
 
 def _run_ytdlp(query, output_template, player_client):
+    # Combine multiple extractor args: youtube + youtubepot-bgutilhttp.
+    # Each provider gets its own arg block separated by spaces in the cli.
     cmd = [
         "yt-dlp",
         "-f", FORMAT_SELECTOR,
@@ -122,8 +121,8 @@ def _run_ytdlp(query, output_template, player_client):
         "--no-warnings",
         "--no-check-certificates",
         "--extractor-args", f"youtube:player_client={player_client}",
+        "--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_SERVER_URL}",
         "--user-agent", USER_AGENT,
-        # Minimal retries inside yt-dlp — we handle fallback at the app level
         "--retries", "1",
         "--fragment-retries", "1",
         "--socket-timeout", "15",
@@ -177,13 +176,13 @@ def download_and_convert(query, safe_name, file_id, output_template,
             break
 
     if not raw_file or not os.path.exists(raw_file):
-        diagnostic = {
+        return None, {
             "stderr": last_err or "download failed",
             "tried_clients": tried_clients,
             "cookies_loaded": bool(COOKIES_FILE and os.path.exists(COOKIES_FILE)),
             "proxy_enabled": bool(PROXY_URL),
+            "pot_server": POT_SERVER_URL,
         }
-        return None, diagnostic
 
     preset = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["high"])
     compressed_file = raw_file.replace(".mp3", "_hq.mp3")
@@ -203,7 +202,6 @@ def download_and_convert(query, safe_name, file_id, output_template,
             timeout=45,
         )
     except subprocess.TimeoutExpired:
-        # ffmpeg hung — return the original file
         return raw_file, None
 
     if os.path.exists(compressed_file):
@@ -219,7 +217,7 @@ def home():
     return jsonify({
         "status": "High-quality MP3 server is running!",
         "cookies_loaded": bool(COOKIES_FILE and os.path.exists(COOKIES_FILE)),
-        "cookies_source": COOKIES_FILE or "none",
+        "pot_server": POT_SERVER_URL,
         "proxy_enabled": bool(PROXY_URL),
         "endpoints": {
             "/download": "Returns JSON with direct URL to MP3",
@@ -227,12 +225,7 @@ def home():
             "/files/<filename>": "Serves stored MP3 by filename",
             "/debug/cookies": "Verify cookies file is loaded",
             "/debug/version": "Check yt-dlp version",
-        },
-        "quality_options": {
-            "low": "64kbps mono (smallest, ~480KB per minute)",
-            "medium": "128kbps stereo (~960KB per minute)",
-            "high": "192kbps stereo (~1.4MB per minute) [default]",
-            "max": "320kbps stereo (~2.4MB per minute)",
+            "/debug/pot": "Check POT server reachability",
         },
         "usage": "/download?q=song+name&quality=high&sec=600",
     })
@@ -240,10 +233,7 @@ def home():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "ok",
-        "cookies_loaded": bool(COOKIES_FILE and os.path.exists(COOKIES_FILE)),
-    })
+    return jsonify({"status": "ok"})
 
 
 @app.route("/debug/cookies", methods=["GET"])
@@ -256,13 +246,11 @@ def debug_cookies():
         try:
             with open(COOKIES_FILE, "r") as f:
                 content = f.read()
-            lines = [l for l in content.splitlines() if l and not l.startswith("#")]
-            info["non_comment_lines"] = len(lines)
+            info["non_comment_lines"] = len([
+                l for l in content.splitlines() if l and not l.startswith("#")
+            ])
             info["mentions_youtube"] = "youtube.com" in content
-            info["looks_like_netscape"] = (
-                content.startswith("# Netscape HTTP Cookie File")
-                or "Netscape HTTP Cookie File" in content[:200]
-            )
+            info["looks_like_netscape"] = "Netscape HTTP Cookie File" in content[:200]
             info["size_bytes"] = len(content)
         except Exception as e:
             info["read_error"] = str(e)
@@ -271,17 +259,46 @@ def debug_cookies():
 
 @app.route("/debug/version", methods=["GET"])
 def debug_version():
-    """Check the installed yt-dlp version."""
     try:
-        result = subprocess.run(
+        ver = subprocess.run(
             ["yt-dlp", "--version"], capture_output=True, text=True, timeout=10
         )
+        # Show the loaded plugins/POT providers
+        plugin_check = subprocess.run(
+            ["yt-dlp", "-v", "--simulate", "--skip-download",
+             "--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_SERVER_URL}",
+             "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+            capture_output=True, text=True, timeout=20,
+        )
+        # Pull out only the POT-related debug lines
+        pot_lines = [
+            l for l in plugin_check.stderr.splitlines()
+            if "[pot]" in l.lower() or "po token" in l.lower()
+        ]
         return jsonify({
-            "yt_dlp_version": result.stdout.strip(),
-            "stderr": result.stderr.strip() if result.stderr else None,
+            "yt_dlp_version": ver.stdout.strip(),
+            "pot_debug": pot_lines[:20],
         })
     except Exception as e:
         return jsonify({"error": str(e)})
+
+
+@app.route("/debug/pot", methods=["GET"])
+def debug_pot():
+    """Check whether the local POT server is reachable."""
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+             "--max-time", "5", f"{POT_SERVER_URL}/ping"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return jsonify({
+            "pot_server_url": POT_SERVER_URL,
+            "http_status": result.stdout.strip(),
+            "reachable": result.stdout.strip() in ("200", "404"),  # any response = up
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "pot_server_url": POT_SERVER_URL})
 
 
 @app.route("/download", methods=["GET"])
@@ -310,7 +327,7 @@ def download_audio():
             return jsonify({
                 "error": "Could not find or convert audio",
                 "diagnostic": error,
-                "hint": "Check /debug/version. Anything older than mid-2025 will likely fail.",
+                "hint": "Check /debug/pot and /debug/version to verify the POT server is reachable.",
             }), 500
 
         filename = os.path.basename(filepath)
@@ -357,10 +374,7 @@ def stream_audio():
         )
 
         if not filepath:
-            return jsonify({
-                "error": "Could not find or convert audio",
-                "diagnostic": error,
-            }), 500
+            return jsonify({"error": "Could not find or convert audio", "diagnostic": error}), 500
 
         return send_file(filepath, mimetype="audio/mpeg")
 
